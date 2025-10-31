@@ -127,6 +127,42 @@ else
     echo "ICMP уже отключён или правила не найдены. Пропускаем."
 fi
 
+# === 7.2 Установка и настройка Fail2Ban ===
+echo "=== Шаг 7.2: Установка и настройка Fail2Ban ==="
+JAIL_LOCAL="/etc/fail2ban/jail.local"
+
+# 1. Установка
+if ! dpkg -l | grep -q "fail2ban"; then
+    echo "Установка Fail2Ban..."
+    apt-get install -y fail2ban
+    systemctl enable --now fail2ban
+else
+    echo "Fail2Ban уже установлен."
+fi
+
+# 2. Настройка
+# (Используем переменную $sshport из Шага 5)
+if [[ -z "$sshport" ]]; then
+    echo "Критическая ошибка: Переменная \$sshport не найдена. Пропуск настройки Fail2Ban."
+else
+    # Проверяем, существует ли файл и настроен ли он уже на наш порт
+    if ! grep -q -E "^\s*port\s*=\s*$sshport" "$JAIL_LOCAL" 2>/dev/null; then
+        echo "Настройка Fail2Ban для порта $sshport..."
+        cat > "$JAIL_LOCAL" << EOF
+[DEFAULT]
+bantime = 1h
+
+[sshd]
+enabled = true
+port = $sshport
+EOF
+        systemctl restart fail2ban
+        echo "Fail2Ban настроен."
+    else
+        echo "Fail2Ban уже настроен на порт $sshport. Пропускаем."
+    fi
+fi
+
 # === 8. Проверка SSH перед отключением root ===
 echo "=== Шаг 8: Проверка SSH подключения ==="
 echo "Проверь подключение к серверу новым пользователем и портом $sshport (не закрывай текущую сессию)."
