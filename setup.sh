@@ -186,22 +186,22 @@ JAIL_LOCAL="/etc/fail2ban/jail.local"
 
 # 1. Установка
 if ! dpkg -l | grep -q "fail2ban"; then
-    echo "Установка Fail2Ban..."
-    apt-get install -y fail2ban
-    systemctl enable --now fail2ban
+    echo "Установка Fail2Ban..."
+    apt-get install -y fail2ban
+    systemctl enable --now fail2ban
 else
-    echo "Fail2Ban уже установлен."
+    echo "Fail2Ban уже установлен."
 fi
 
 # 2. Настройка
 # (Используем переменную $sshport из Шага 5)
 if [[ -z "$sshport" ]]; then
-    echo "Критическая ошибка: Переменная \$sshport не найдена. Пропуск настройки Fail2Ban."
+    echo "Критическая ошибка: Переменная \$sshport не найдена. Пропуск настройки Fail2Ban."
 else
-    # Проверяем, существует ли файл и настроен ли он уже на наш порт
-    if ! grep -q -E "^\s*port\s*=\s*$sshport" "$JAIL_LOCAL" 2>/dev/null; then
-        echo "Настройка Fail2Ban для порта $sshport..."
-        cat > "$JAIL_LOCAL" << EOF
+    # Проверяем, существует ли файл и настроен ли он уже на наш порт
+    if ! grep -q -E "^\s*port\s*=\s*$sshport" "$JAIL_LOCAL" 2>/dev/null; then
+        echo "Настройка Fail2Ban для порта $sshport..."
+        cat > "$JAIL_LOCAL" << EOF
 [DEFAULT]
 bantime = 1h
 
@@ -209,11 +209,11 @@ bantime = 1h
 enabled = true
 port = $sshport
 EOF
-        systemctl restart fail2ban
-        echo "Fail2Ban настроен."
-    else
-        echo "Fail2Ban уже настроен на порт $sshport. Пропускаем."
-    fi
+        systemctl restart fail2ban
+        echo "Fail2Ban настроен."
+    else
+        echo "Fail2Ban уже настроен на порт $sshport. Пропускаем."
+    fi
 fi
 
 # === 7.3 Усиление ядра (sysctl) и отключение IPv6 ===
