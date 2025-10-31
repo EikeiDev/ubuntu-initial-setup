@@ -10,16 +10,44 @@ port_in_use() { ss -tulpn | grep -q ":$1 "; }
 echo "=== Шаг 1: Обновление системы ==="
 apt-get update && apt full-upgrade -y && apt autoremove -y
 
+# === 1.1 Настройка автоматических обновлений ===
+echo "=== Шаг 1.1: Настройка unattended-upgrades ==="
+if ! dpkg -l | grep -q "unattended-upgrades"; then
+    apt-get install -y unattended-upgrades
+fi
+
+# Проверяем, включены ли авто-обновления
+if ! grep -q -E "^\s*APT::Periodic::Update-Package-Lists\s*\"1\"" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+    echo "Включение unattended-upgrades..."
+    # Создаем файл конфигурации, который включает их
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+    # Запускаем reconfigure, чтобы применить настройки
+    dpkg-reconfigure -plow unattended-upgrades
+else
+    echo "Unattended-upgrades уже включены. Пропускаем."
+fi
+
 # === 2. Установка UFW и bc ===
 echo "=== Шаг 2: Установка UFW и bc ==="
 apt-get install -y ufw bc
 
 # === 3. Создание нового пользователя ===
 echo "=== Шаг 3: Создание нового пользователя ==="
-read -p "Введите имя нового пользователя: " new_user
+new_user=""
+while [[ -z "$new_user" ]]; do
+    read -p "Введите имя нового пользователя: " new_user
+    if [[ -z "$new_user" ]]; then
+        echo "Ошибка: Имя пользователя не может быть пустым. Попробуйте снова."
+    fi
+done
+
 if ! user_exists "$new_user"; then
-    adduser "$new_user"
+    adduser --gecos "" "$new_user"
     usermod -aG sudo "$new_user"
+    echo "Пользователь $new_user создан."
 else
     echo "Пользователь $new_user уже существует. Пропускаем."
 fi
@@ -41,7 +69,16 @@ fi
 # === 5. Настройка SSH ===
 echo "=== Шаг 5: Настройка SSH ==="
 os_version=$(lsb_release -sr)
-read -p "Введите новый порт SSH: " sshport
+
+sshport="" 
+while true; do
+    read -p "Введите новый порт SSH (например, 2222): " sshport
+    if [[ "$sshport" =~ ^[0-9]+$ ]] && [ "$sshport" -gt 1023 ] && [ "$sshport" -lt 65536 ]; then
+        break
+    else
+        echo "Ошибка: Введите корректный порт (число от 1024 до 65535)."
+    fi
+done
 
 if (( $(echo "$os_version >= 22.10" | bc -l) )); then
     # ---- Используем systemd socket override ----
@@ -53,7 +90,9 @@ if (( $(echo "$os_version >= 22.10" | bc -l) )); then
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:$sshport
-BindIPv6Only=both
+
+Accept=
+
 FreeBind=yes
 Backlog=128
 ReusePort=yes
@@ -81,14 +120,31 @@ fi
 
 # === 6. Безопасность SSH ===
 echo "=== Шаг 6: Настройка безопасности SSH ==="
-sed -i -e '/^#PasswordAuthentication/ c\PasswordAuthentication no' \
-       -e '/^PasswordAuthentication/ c\PasswordAuthentication no' \
-       -e '/^#PermitRootLogin/ c\PermitRootLogin no' \
-       -e '/^PermitRootLogin/ c\PermitRootLogin no' \
-       -e '/^#PubkeyAuthentication/ c\PubkeyAuthentication yes' \
-       /etc/ssh/sshd_config
+CONFIG_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 
-echo "PasswordAuthentication no" > /etc/ssh/sshd_config.d/50-cloud-init.conf
+if ! grep -q "PermitRootLogin no" "$CONFIG_FILE" 2>/dev/null; then
+    echo "Создание файла $CONFIG_FILE для усиления SSH..."
+    
+    cat > "$CONFIG_FILE" << EOF
+# 1. Запрещаем вход root
+PermitRootLogin no
+
+# 2. Запрещаем вход по паролю (и связанные с ним)
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+
+# 3. Явно разрешаем ключи
+PubkeyAuthentication yes
+
+# 4. Слушать только IPv4
+AddressFamily inet
+EOF
+
+    systemctl restart sshd
+    echo "SSH настроен и перезапущен."
+else
+    echo "Файл $CONFIG_FILE уже существует. Пропускаем."
+fi
 
 # === 7. UFW ===
 echo "=== Шаг 7: Настройка UFW ==="
@@ -158,6 +214,37 @@ EOF
     else
         echo "Fail2Ban уже настроен на порт $sshport. Пропускаем."
     fi
+fi
+
+# === 7.3 Усиление ядра (sysctl) и отключение IPv6 ===
+echo "=== Шаг 7.3: Настройка sysctl ==="
+SYSCTL_FILE="/etc/sysctl.d/99-hardening.conf"
+
+if ! grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$SYSCTL_FILE" 2>/dev/null; then
+    echo "Применение настроек sysctl (отключение IPv6, защита от спуфинга, SYN-cookies)..."
+    cat > "$SYSCTL_FILE" << EOF
+# --- Отключение IPv6 ---
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+
+# --- Защита от IP-спуфинга ---
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# --- Защита от SYN-флуда ---
+net.ipv4.tcp_syncookies = 1
+
+# --- Игнорировать ICMP редиректы ---
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+EOF
+
+    # Применяем настройки немедленно
+    sysctl -p "$SYSCTL_FILE"
+    echo "Настройки sysctl применены."
+else
+    echo "Настройки sysctl ($SYSCTL_FILE) уже применены. Пропускаем."
 fi
 
 # === 8. Проверка SSH перед отключением root ===
