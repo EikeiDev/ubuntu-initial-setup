@@ -5,7 +5,7 @@
 
 Для установки достаточно выполнить данную команду на сервере.
 ```
-sh <(wget -O - https://raw.githubusercontent.com/EikeiDev/ubuntu-initial-setup/refs/heads/main/setup.sh)
+bash <(wget -O - https://raw.githubusercontent.com/EikeiDev/ubuntu-initial-setup/refs/heads/main/setup.sh)
 ```
 
 ### Что делает скрипт?
