@@ -140,7 +140,7 @@ PubkeyAuthentication yes
 AddressFamily inet
 EOF
 
-    systemctl restart sshd
+    systemctl restart ssh
     echo "SSH настроен и перезапущен."
 else
     echo "Файл $CONFIG_FILE уже существует. Пропускаем."
