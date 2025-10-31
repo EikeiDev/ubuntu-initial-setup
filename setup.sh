@@ -16,15 +16,13 @@ if ! dpkg -l | grep -q "unattended-upgrades"; then
     apt-get install -y unattended-upgrades
 fi
 
-# Проверяем, включены ли авто-обновления
 if ! grep -q -E "^\s*APT::Periodic::Update-Package-Lists\s*\"1\"" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
     echo "Включение unattended-upgrades..."
-    # Создаем файл конфигурации, который включает их
     cat > /etc/apt/apt.conf.d/20auto-upgrades << EOF
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-    # Запускаем reconfigure, чтобы применить настройки
+
     dpkg-reconfigure -plow unattended-upgrades
 else
     echo "Unattended-upgrades уже включены. Пропускаем."
@@ -176,11 +174,9 @@ if grep -q -- "--icmp-type echo-request -j ACCEPT" "$UFW_RULES"; then
     cp "$UFW_RULES" "${UFW_RULES}.bak.$(date +%F_%T)"
     echo "Создана резервная копия ${UFW_RULES}.bak.$(date +%F_%T)"
 
-    # Заменяем ACCEPT на DROP в ICMP блоках
     sed -i '/# ok icmp codes for INPUT/,/# ok icmp code for FORWARD/ s/-j ACCEPT/-j DROP/g' "$UFW_RULES"
     sed -i '/# ok icmp code for FORWARD/,/-A ufw-before-forward -p icmp --icmp-type echo-request/ s/-j ACCEPT/-j DROP/g' "$UFW_RULES"
 
-    # Добавляем строку DROP первой в блок INPUT (если её нет)
     if ! grep -q -- "-A ufw-before-input -p icmp --icmp-type source-quench -j DROP" "$UFW_RULES"; then
         sed -i '/# ok icmp codes for INPUT/a -A ufw-before-input -p icmp --icmp-type source-quench -j DROP' "$UFW_RULES"
     fi
@@ -205,11 +201,10 @@ else
 fi
 
 # 2. Настройка
-# (Используем переменную $sshport из Шага 5)
 if [[ -z "$sshport" ]]; then
     echo "Критическая ошибка: Переменная \$sshport не найдена. Пропуск настройки Fail2Ban."
 else
-    # Проверяем, существует ли файл и настроен ли он уже на наш порт
+
     if ! grep -q -E "^\s*port\s*=\s*$sshport" "$JAIL_LOCAL" 2>/dev/null; then
         echo "Настройка Fail2Ban для порта $sshport..."
         cat > "$JAIL_LOCAL" << EOF
@@ -251,7 +246,6 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 EOF
 
-    # Применяем настройки немедленно
     sysctl -p "$SYSCTL_FILE"
     echo "Настройки sysctl применены."
 else
