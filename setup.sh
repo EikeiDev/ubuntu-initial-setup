@@ -120,6 +120,15 @@ fi
 
 # === 6. Безопасность SSH ===
 echo "=== Шаг 6: Настройка безопасности SSH ==="
+
+# --- (A) Принудительно отключаем пароли в cloud-init ---
+CLOUD_INIT_CONF="/etc/ssh/sshd_config.d/50-cloud-init.conf"
+if [ -f "$CLOUD_INIT_CONF" ]; then
+    echo "Принудительное отключение паролей в $CLOUD_INIT_CONF..."
+    echo "PasswordAuthentication no" > "$CLOUD_INIT_CONF"
+fi
+
+# --- (B) Устанавливаем наши глобальные настройки ---
 CONFIG_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 
 if ! grep -q "PermitRootLogin no" "$CONFIG_FILE" 2>/dev/null; then
@@ -139,11 +148,13 @@ PubkeyAuthentication yes
 # 4. Слушать только IPv4
 AddressFamily inet
 EOF
-
+    
     systemctl restart ssh
     echo "SSH настроен и перезапущен."
 else
     echo "Файл $CONFIG_FILE уже существует. Пропускаем."
+    echo "Применение фикса 50-cloud-init и перезапуск SSH..."
+    systemctl restart ssh
 fi
 
 # === 7. UFW ===
