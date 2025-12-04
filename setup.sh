@@ -8,7 +8,7 @@ port_in_use() { ss -tulpn | grep -q ":$1 "; }
 
 # === 1. Обновление системы ===
 echo "=== Шаг 1: Обновление системы ==="
-apt-get update && apt full-upgrade -y && apt autoremove -y
+apt-get update && apt-get upgrade -y && apt-get clean && apt-get autoremove -y
 
 # === 1.1 Настройка автоматических обновлений ===
 echo "=== Шаг 1.1: Настройка unattended-upgrades ==="
@@ -232,7 +232,7 @@ if ! grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$SYSCTL_FILE" 2>/dev/null; th
 # --- Отключение IPv6 ---
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
 
 # --- Защита от IP-спуфинга ---
 net.ipv4.conf.all.rp_filter = 1
