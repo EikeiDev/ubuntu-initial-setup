@@ -18,7 +18,7 @@ safe_ssh_restart() {
         chmod 0755 /run/sshd
     fi
 
-    log_info "Валидация конфигурации SSH..."
+    log_info "Валидация конфигурации SSH (sshd -t)..."
     if sshd -t; then
         if systemctl is-active --quiet ssh.socket; then
             systemctl daemon-reload
@@ -64,7 +64,7 @@ if [ -n "$MISSING_DEPS" ]; then
     apt-get install -y lsb-release bc
 fi
 
-# === Шаг 1: Обновление системы ===
+# === Шаг 1: Система ===
 log_step "Шаг 1: Обновление системы"
 export DEBIAN_FRONTEND=noninteractive
 apt-get full-upgrade -y && apt-get autoremove -y
@@ -112,7 +112,7 @@ SSH_DIR="/home/$new_user/.ssh"
 if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
-    ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N ""
+    ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N "" -C "$new_user@$(hostname)"
     cat "$SSH_DIR/id_ed25519.pub" > "$SSH_DIR/authorized_keys"
     chmod 600 "$SSH_DIR/authorized_keys"
     chown -R "$new_user:$new_user" "$SSH_DIR"
