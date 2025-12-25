@@ -18,7 +18,7 @@ safe_ssh_restart() {
         chmod 0755 /run/sshd
     fi
 
-    log_info "Валидация конфигурации SSH (sshd -t)..."
+    log_info "Валидация конфигурации SSH..."
     if sshd -t; then
         if systemctl is-active --quiet ssh.socket; then
             systemctl daemon-reload
@@ -64,7 +64,7 @@ if [ -n "$MISSING_DEPS" ]; then
     apt-get install -y lsb-release bc
 fi
 
-# === Шаг 1: Система ===
+# === Шаг 1: Обновление системы ===
 log_step "Шаг 1: Обновление системы"
 export DEBIAN_FRONTEND=noninteractive
 apt-get full-upgrade -y && apt-get autoremove -y
