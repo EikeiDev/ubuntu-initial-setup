@@ -1,57 +1,113 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-# === Вспомогательные функции ===
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "\n${YELLOW}=== $1 ===${NC}"; }
+
+safe_ssh_restart() {
+    if [ ! -d /run/sshd ]; then
+        mkdir -p /run/sshd
+        chmod 0755 /run/sshd
+    fi
+
+    log_info "Валидация конфигурации SSH (sshd -t)..."
+    if sshd -t; then
+        if systemctl is-active --quiet ssh.socket; then
+            systemctl daemon-reload
+            systemctl restart ssh.socket
+        fi
+        systemctl restart ssh
+        log_info "Служба SSH успешно перезапущена."
+    else
+        log_err "Конфигурация SSH содержит ошибки!"
+        log_err "Рестарт отменен во избежание потери доступа."
+        exit 1
+    fi
+}
+
+backup_file() {
+    if [ -f "$1" ]; then
+        cp "$1" "$1.bak.$(date +%F_%H%M%S)"
+        log_info "Бэкап конфига: $1.bak..."
+    fi
+}
+
+# 1) === Проверка Root прав ===
+if [ "$EUID" -ne 0 ]; then
+    log_err "Пожалуйста запустите скрипт от имени root."
+    exit 1
+fi
+
 user_exists() { id "$1" &>/dev/null; }
-port_in_use() { ss -tulpn | grep -q ":$1 "; }
 
-# === 1. Обновление системы ===
-echo "=== Шаг 1: Обновление системы ==="
-apt-get update && apt full-upgrade -y && apt autoremove -y
+# 2) === Установка зависимостей ===
+log_step "Проверка зависимостей"
+apt-get update -qq
 
-# === 1.1 Настройка автоматических обновлений ===
-echo "=== Шаг 1.1: Настройка unattended-upgrades ==="
+MISSING_DEPS=""
+for cmd in lsb_release bc; do
+    if ! command -v $cmd &> /dev/null; then
+        MISSING_DEPS="$MISSING_DEPS $cmd"
+    fi
+done
+
+if [ -n "$MISSING_DEPS" ]; then
+    log_warn "Установка зависимостей: $MISSING_DEPS"
+    apt-get install -y lsb-release bc
+fi
+
+# === Шаг 1: Система ===
+log_step "Шаг 1: Обновление системы"
+export DEBIAN_FRONTEND=noninteractive
+apt-get full-upgrade -y && apt-get autoremove -y
+
+# === Шаг 1.1: Автоматические обновления ===
+log_step "Шаг 1.1: Настройка автоматических обновлений"
 if ! dpkg -l | grep -q "unattended-upgrades"; then
     apt-get install -y unattended-upgrades
 fi
 
-if ! grep -q -E "^\s*APT::Periodic::Update-Package-Lists\s*\"1\"" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
-    echo "Включение unattended-upgrades..."
+if ! grep -q "APT::Periodic::Unattended-Upgrade" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
     cat > /etc/apt/apt.conf.d/20auto-upgrades << EOF
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-
     dpkg-reconfigure -plow unattended-upgrades
+    log_info "Автообновления безопасности включены."
 else
-    echo "Unattended-upgrades уже включены. Пропускаем."
+    log_info "Уже настроено."
 fi
 
-# === 2. Установка UFW и bc ===
-echo "=== Шаг 2: Установка UFW и bc ==="
-apt-get install -y ufw bc
+# === Шаг 2: Установка UFW и Fail2Ban ===
+log_step "Шаг 2: Установка UFW и Fail2Ban"
+apt-get install -y ufw fail2ban
 
-# === 3. Создание нового пользователя ===
-echo "=== Шаг 3: Создание нового пользователя ==="
+# === Шаг 3: Создание пользователя ===
+log_step "Шаг 3: Создание пользователя"
 new_user=""
 while [[ -z "$new_user" ]]; do
     read -p "Введите имя нового пользователя: " new_user
-    if [[ -z "$new_user" ]]; then
-        echo "Ошибка: Имя пользователя не может быть пустым. Попробуйте снова."
-    fi
+    if [[ -z "$new_user" ]]; then log_warn "Имя не может быть пустым."; fi
 done
 
 if ! user_exists "$new_user"; then
     adduser --gecos "" "$new_user"
     usermod -aG sudo "$new_user"
-    echo "Пользователь $new_user создан."
+    log_info "Пользователь $new_user создан."
 else
-    echo "Пользователь $new_user уже существует. Пропускаем."
+    log_info "Пользователь $new_user уже существует."
 fi
 
-# === 4. Генерация SSH ключей ===
-echo "=== Шаг 4: Генерация SSH ключей ==="
+# === Шаг 4: Генерация SSH ключей ===
+log_step "Шаг 4: Генерация SSH ключей"
 SSH_DIR="/home/$new_user/.ssh"
 if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
     mkdir -p "$SSH_DIR"
@@ -60,217 +116,163 @@ if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
     cat "$SSH_DIR/id_ed25519.pub" > "$SSH_DIR/authorized_keys"
     chmod 600 "$SSH_DIR/authorized_keys"
     chown -R "$new_user:$new_user" "$SSH_DIR"
+    log_info "Ключи Ed25519 сгенерированы."
 else
-    echo "SSH ключи для $new_user уже существуют. Пропускаем."
+    log_info "Ключи уже существуют."
 fi
 
-# === 5. Настройка SSH ===
-echo "=== Шаг 5: Настройка SSH ==="
+# === Шаг 5: Смена порта SSH ===
+log_step "Шаг 5: Смена порта SSH"
 os_version=$(lsb_release -sr)
-
 sshport="" 
+
 while true; do
-    read -p "Введите новый порт SSH (например, 2222): " sshport
+    read -p "Новый порт SSH (1024-65535): " sshport
     if [[ "$sshport" =~ ^[0-9]+$ ]] && [ "$sshport" -gt 1023 ] && [ "$sshport" -lt 65536 ]; then
         break
     else
-        echo "Ошибка: Введите корректный порт (число от 1024 до 65535)."
+        log_warn "Некорректный порт."
     fi
 done
 
+backup_file "/etc/ssh/sshd_config"
+
 if (( $(echo "$os_version >= 22.10" | bc -l) )); then
-    # ---- Используем systemd socket override ----
     mkdir -p /etc/systemd/system/ssh.socket.d
     OVERRIDE_FILE="/etc/systemd/system/ssh.socket.d/override.conf"
 
-    if ! grep -q "0.0.0.0:$sshport" "$OVERRIDE_FILE" 2>/dev/null; then
-        cat > "$OVERRIDE_FILE" <<EOF
+    cat > "$OVERRIDE_FILE" <<EOF
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:$sshport
-
-Accept=
-
+Accept=no
 FreeBind=yes
-Backlog=128
-ReusePort=yes
 EOF
-        echo "Создан override для ssh.socket на порт $sshport"
-    else
-        echo "Override уже содержит порт $sshport. Пропускаем."
-    fi
-
-    systemctl daemon-reload
-    systemctl restart ssh.socket
-    systemctl restart ssh
-
-    echo "SSH socket успешно перезапущен и слушает порт $sshport (только IPv4)"
+    log_info "Systemd Override применен (Port $sshport, IPv4)."
 else
-    # ---- Старый способ для систем без socket activation ----
     if ! grep -q "^Port $sshport" /etc/ssh/sshd_config; then
         sed -i "s/^#Port 22/Port $sshport/" /etc/ssh/sshd_config
-        systemctl restart ssh
-        echo "sshd_config настроен на порт $sshport"
-    else
-        echo "sshd_config уже настроен на этот порт. Пропускаем."
+        sed -i "s/^Port 22/Port $sshport/" /etc/ssh/sshd_config
+        log_info "sshd_config обновлен (Port $sshport)."
     fi
 fi
 
-# === 6. Безопасность SSH ===
-echo "=== Шаг 6: Настройка безопасности SSH ==="
+safe_ssh_restart
 
-# --- (A) Принудительно отключаем пароли в cloud-init ---
-CLOUD_INIT_CONF="/etc/ssh/sshd_config.d/50-cloud-init.conf"
-if [ -f "$CLOUD_INIT_CONF" ]; then
-    echo "Принудительное отключение паролей в $CLOUD_INIT_CONF..."
-    echo "PasswordAuthentication no" > "$CLOUD_INIT_CONF"
-fi
+# === Шаг 6: Настройка безопасности ===
+log_step "Шаг 6: Настройка безопасности"
 
-# --- (B) Устанавливаем наши глобальные настройки ---
+# Чистка cloud-init конфигов
+[ -f "/etc/ssh/sshd_config.d/50-cloud-init.conf" ] && echo "PasswordAuthentication no" > "/etc/ssh/sshd_config.d/50-cloud-init.conf"
+
 CONFIG_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
-
-if ! grep -q "PermitRootLogin no" "$CONFIG_FILE" 2>/dev/null; then
-    echo "Создание файла $CONFIG_FILE для усиления SSH..."
-    
-    cat > "$CONFIG_FILE" << EOF
-# 1. Запрещаем вход root
+cat > "$CONFIG_FILE" << EOF
 PermitRootLogin no
-
-# 2. Запрещаем вход по паролю (и связанные с ним)
 PasswordAuthentication no
 ChallengeResponseAuthentication no
-
-# 3. Явно разрешаем ключи
 PubkeyAuthentication yes
-
-# 4. Слушать только IPv4
 AddressFamily inet
 EOF
-    
-    systemctl restart ssh
-    echo "SSH настроен и перезапущен."
-else
-    echo "Файл $CONFIG_FILE уже существует. Пропускаем."
-    echo "Применение фикса 50-cloud-init и перезапуск SSH..."
-    systemctl restart ssh
-fi
 
-# === 7. UFW ===
-echo "=== Шаг 7: Настройка UFW ==="
+log_info "Конфигурация безопасности применена."
+safe_ssh_restart
+
+# === Шаг 7: Настройка UFW ===
+log_step "Шаг 7: Настройка UFW"
 if ! ufw status | grep -q "$sshport/tcp"; then
     ufw allow "$sshport"/tcp
+    log_info "Порт $sshport/tcp разрешен."
 fi
 
-ufw_status=$(ufw status | head -n1)
-if [[ "$ufw_status" == "Status: inactive" ]]; then
-    ufw --force enable
+if [[ $(ufw status | head -n1) == "Status: inactive" ]]; then
+    echo "y" | ufw enable
+    log_info "UFW активирован."
 fi
 
-# === 7.1 Отключение ICMP (ping) ===
-echo "=== Шаг 7.1: Отключение ICMP (ping) ==="
+# === Шаг 7.1: Настройка ICMP ===
+log_step "Шаг 7.1: Настройка ICMP"
 UFW_RULES="/etc/ufw/before.rules"
+backup_file "$UFW_RULES"
 
-if grep -q -- "--icmp-type echo-request -j ACCEPT" "$UFW_RULES"; then
-    cp "$UFW_RULES" "${UFW_RULES}.bak.$(date +%F_%T)"
-    echo "Создана резервная копия ${UFW_RULES}.bak.$(date +%F_%T)"
-
-    sed -i '/# ok icmp codes for INPUT/,/# ok icmp code for FORWARD/ s/-j ACCEPT/-j DROP/g' "$UFW_RULES"
-    sed -i '/# ok icmp code for FORWARD/,/-A ufw-before-forward -p icmp --icmp-type echo-request/ s/-j ACCEPT/-j DROP/g' "$UFW_RULES"
-
-    if ! grep -q -- "-A ufw-before-input -p icmp --icmp-type source-quench -j DROP" "$UFW_RULES"; then
-        sed -i '/# ok icmp codes for INPUT/a -A ufw-before-input -p icmp --icmp-type source-quench -j DROP' "$UFW_RULES"
-    fi
-
-    echo "ICMP (ping) отключён через UFW."
-    ufw disable && ufw --force enable
+if grep -q "icmp-type echo-request -j ACCEPT" "$UFW_RULES"; then
+    sed -i 's/-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT/-A ufw-before-input -p icmp --icmp-type echo-request -j DROP/g' "$UFW_RULES"
+    ufw reload
+    log_info "ICMP Echo Request: DROP (Сервер скрыт от пинга)."
+elif grep -q "icmp-type echo-request -j DROP" "$UFW_RULES"; then
+    log_info "Ping уже отключен."
 else
-    echo "ICMP уже отключён или правила не найдены. Пропускаем."
+    log_warn "Правило ICMP не найдено автоматически. Проверьте $UFW_RULES."
 fi
 
-# === 7.2 Установка и настройка Fail2Ban ===
-echo "=== Шаг 7.2: Установка и настройка Fail2Ban ==="
+# === Шаг 7.2: Настройка Fail2Ban ===
+log_step "Шаг 7.2: Настройка Fail2Ban"
 JAIL_LOCAL="/etc/fail2ban/jail.local"
-
-# 1. Установка
-if ! dpkg -l | grep -q "fail2ban"; then
-    echo "Установка Fail2Ban..."
-    apt-get install -y fail2ban
-    systemctl enable --now fail2ban
-else
-    echo "Fail2Ban уже установлен."
-fi
-
-# 2. Настройка
-if [[ -z "$sshport" ]]; then
-    echo "Критическая ошибка: Переменная \$sshport не найдена. Пропуск настройки Fail2Ban."
-else
-
-    if ! grep -q -E "^\s*port\s*=\s*$sshport" "$JAIL_LOCAL" 2>/dev/null; then
-        echo "Настройка Fail2Ban для порта $sshport..."
-        cat > "$JAIL_LOCAL" << EOF
+if ! grep -q "port = $sshport" "$JAIL_LOCAL" 2>/dev/null; then
+    cat > "$JAIL_LOCAL" << EOF
 [DEFAULT]
 bantime = 1h
-
+findtime = 10m
+maxretry = 5
 [sshd]
 enabled = true
 port = $sshport
 EOF
-        systemctl restart fail2ban
-        echo "Fail2Ban настроен."
-    else
-        echo "Fail2Ban уже настроен на порт $sshport. Пропускаем."
-    fi
+    systemctl restart fail2ban
+    log_info "Jail для SSH настроен."
 fi
 
-# === 7.3 Усиление ядра (sysctl) и отключение IPv6 ===
-echo "=== Шаг 7.3: Настройка sysctl ==="
+# === Шаг 7.3: Настройка Sysctl ===
+log_step "Шаг 7.3: Настройка Sysctl"
 SYSCTL_FILE="/etc/sysctl.d/99-hardening.conf"
-
 if ! grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$SYSCTL_FILE" 2>/dev/null; then
-    echo "Применение настроек sysctl (отключение IPv6, защита от спуфинга, SYN-cookies)..."
     cat > "$SYSCTL_FILE" << EOF
-# --- Отключение IPv6 ---
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
-
-# --- Защита от IP-спуфинга ---
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
-
-# --- Защита от SYN-флуда ---
 net.ipv4.tcp_syncookies = 1
-
-# --- Игнорировать ICMP редиректы ---
 net.ipv4.conf.all.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
 EOF
-
-    sysctl -p "$SYSCTL_FILE"
-    echo "Настройки sysctl применены."
-else
-    echo "Настройки sysctl ($SYSCTL_FILE) уже применены. Пропускаем."
+    sysctl -p "$SYSCTL_FILE" > /dev/null
+    log_info "IPv6 отключен, защита от спуфинга включена."
 fi
 
-# === 8. Проверка SSH перед отключением root ===
-echo "=== Шаг 8: Проверка SSH подключения ==="
-echo "Проверь подключение к серверу новым пользователем и портом $sshport (не закрывай текущую сессию)."
-
-# === 9. Отключение root ===
-echo "=== Шаг 9: Отключение root ==="
-if ! grep -q "^root:.*nologin" /etc/passwd; then
-    read -p "Если вы проверили подключение, введите 'yes' для отключения root: " confirm
+# === Шаг 8: Отключение учетной записи root ===
+log_step "Шаг 8: Отключение учетной записи root"
+if [ "$(passwd -S root | awk '{print $2}')" != "L" ]; then
+    read -p "Отключить учетную запись root? (yes/no): " confirm
     if [[ "$confirm" == "yes" ]]; then
-        usermod -s /usr/sbin/nologin root
-        echo "Root отключен."
-    else
-        echo "Root не отключен. Сделай это вручную после проверки SSH."
+        passwd -l root
+        log_info "Учетная запись root отключена."
     fi
 else
-    echo "Root уже отключен. Пропускаем."
+    log_info "Учетная запись root уже отключена."
 fi
 
-# === 10. Приватный ключ ===
-echo "=== Шаг 10: Приватный ключ нового пользователя ==="
+# === Завершение настройки ===
+echo ""
+echo "========================================================"
+log_info "НАСТРОЙКА ЗАВЕРШЕНА."
+echo "--------------------------------------------------------"
+echo -e "User: ${YELLOW}$new_user${NC}"
+echo -e "Port: ${YELLOW}$sshport${NC}"
+echo "--------------------------------------------------------"
+log_warn "СКОПИРУЙТЕ ПРИВАТНЫЙ КЛЮЧ:"
+echo "--------------------------------------------------------"
+
 cat "$SSH_DIR/id_ed25519"
-echo -e "\nНастройка завершена. Подключайся через порт $sshport новым пользователем."
+
+echo ""
+echo "--------------------------------------------------------"
+read -p "Скопировали? Нажмите ENTER для удаления ключа с сервера..." confirm_del
+
+rm -f "$SSH_DIR/id_ed25519"
+
+if [ ! -f "$SSH_DIR/id_ed25519" ]; then
+    log_info "Приватный ключ удален."
+else
+    log_err "Ошибка удаления. Удалите вручную: rm $SSH_DIR/id_ed25519"
+fi
+
+echo "========================================================"
