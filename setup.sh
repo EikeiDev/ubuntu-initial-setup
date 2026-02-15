@@ -7,6 +7,75 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+export DEBIAN_FRONTEND=noninteractive
+APT_OPTS="-o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+
+show_spinner() {
+    local pid=$1
+    local delay=0.1
+    local spinstr='|/-\'
+    while kill -0 "$pid" 2>/dev/null; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+run_silent() {
+    local desc="$1"
+    shift
+    local log_file=$(mktemp)
+    
+    echo -n -e "${GREEN}[INFO]${NC} ${desc}..."
+    
+    "$@" > "$log_file" 2>&1 &
+    local pid=$!
+    show_spinner "$pid"
+    
+    local exit_code=0
+    wait $pid || exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}[OK]${NC}"
+        rm -f "$log_file"
+    else
+        echo -e "${RED}[FAIL]${NC}"
+        echo -e "${RED}Command failed with exit code $exit_code:${NC}"
+        cat "$log_file"
+        rm -f "$log_file"
+        exit $exit_code
+    fi
+}
+
+apply_sysctl() {
+    local key="$1"
+    local value="$2"
+    local file="${3:-/etc/sysctl.d/99-hardening.conf}"
+    
+    if sysctl -w "$key=$value" >/dev/null 2>&1; then
+        if ! grep -q "^$key = $value" "$file" 2>/dev/null; then
+            echo "$key = $value" >> "$file"
+        fi
+        return 0
+    else
+        log_warn "Не удалось применить $key=$value (возможно, ограничение контейнера). Пропускаем."
+        return 0
+    fi
+}
+
+create_swap_file() {
+    local size="$1"
+    if ! fallocate -l $size /swapfile 2>/dev/null; then
+        dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+}
+
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
@@ -50,7 +119,7 @@ user_exists() { id "$1" &>/dev/null; }
 
 # 2) === Установка зависимостей ===
 log_step "Проверка зависимостей"
-apt-get update -qq
+run_silent "Обновление списка пакетов" apt-get $APT_OPTS update -qq
 
 MISSING_DEPS=""
 for cmd in lsb_release bc; do
@@ -61,18 +130,17 @@ done
 
 if [ -n "$MISSING_DEPS" ]; then
     log_warn "Установка зависимостей: $MISSING_DEPS"
-    apt-get install -y lsb-release bc
+    run_silent "Установка зависимостей" apt-get $APT_OPTS install -y $MISSING_DEPS
 fi
 
 # === Шаг 1: Система ===
 log_step "Шаг 1: Обновление системы"
-export DEBIAN_FRONTEND=noninteractive
-apt-get full-upgrade -y && apt-get autoremove -y
+run_silent "Полное обновление системы" bash -c "apt-get $APT_OPTS full-upgrade -y && apt-get $APT_OPTS autoremove -y"
 
 # === Шаг 1.1: Автоматические обновления ===
 log_step "Шаг 1.1: Настройка автоматических обновлений"
 if ! dpkg -l | grep -q "unattended-upgrades"; then
-    apt-get install -y unattended-upgrades
+    apt-get $APT_OPTS install -y unattended-upgrades
 fi
 
 if ! grep -q "APT::Periodic::Unattended-Upgrade" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
@@ -88,7 +156,7 @@ fi
 
 # === Шаг 2: Установка UFW и Fail2Ban ===
 log_step "Шаг 2: Установка UFW и Fail2Ban"
-apt-get install -y ufw fail2ban
+run_silent "Установка пакетов безопасности" apt-get $APT_OPTS install -y ufw fail2ban
 
 # === Шаг 3: Создание пользователя ===
 log_step "Шаг 3: Создание пользователя"
@@ -99,9 +167,11 @@ while [[ -z "$new_user" ]]; do
 done
 
 if ! user_exists "$new_user"; then
+    log_info "Создание пользователя $new_user..."
+    log_warn "Вам будет предложено ввести пароль для нового пользователя."
     adduser --gecos "" "$new_user"
     usermod -aG sudo "$new_user"
-    log_info "Пользователь $new_user создан."
+    log_info "Пользователь $new_user успешно создан."
 else
     log_info "Пользователь $new_user уже существует."
 fi
@@ -137,7 +207,7 @@ done
 
 backup_file "/etc/ssh/sshd_config"
 
-if (( $(echo "$os_version >= 22.10" | bc -l) )); then
+if [[ "$os_version" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$os_version >= 22.10" | bc -l) )); then
     mkdir -p /etc/systemd/system/ssh.socket.d
     OVERRIDE_FILE="/etc/systemd/system/ssh.socket.d/override.conf"
 
@@ -223,23 +293,106 @@ fi
 
 # === Шаг 7.3: Настройка Sysctl ===
 log_step "Шаг 7.3: Настройка Sysctl"
-SYSCTL_FILE="/etc/sysctl.d/99-hardening.conf"
-if ! grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$SYSCTL_FILE" 2>/dev/null; then
-    cat > "$SYSCTL_FILE" << EOF
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.conf.all.accept_redirects = 0
-EOF
-    sysctl -p "$SYSCTL_FILE" > /dev/null
-    log_info "IPv6 отключен, защита от спуфинга включена."
+read -p "Отключить IPv6? (y/n, default: y): " disable_ipv6
+disable_ipv6=${disable_ipv6:-y}
+
+if [[ "$disable_ipv6" =~ ^[Yy]$ ]]; then
+    SYSCTL_FILE="/etc/sysctl.d/99-hardening.conf"
+    if ! grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$SYSCTL_FILE" 2>/dev/null; then
+
+        apply_sysctl "net.ipv6.conf.all.disable_ipv6" "1"
+        apply_sysctl "net.ipv6.conf.default.disable_ipv6" "1"
+        apply_sysctl "net.ipv6.conf.lo.disable_ipv6" "1"
+        apply_sysctl "net.ipv4.conf.all.rp_filter" "1"
+        apply_sysctl "net.ipv4.conf.default.rp_filter" "1"
+        apply_sysctl "net.ipv4.tcp_syncookies" "1"
+        apply_sysctl "net.ipv4.conf.all.accept_redirects" "0"
+        
+        # Перечитываем конфиги (игнорируем ошибки)
+        sysctl --system > /dev/null 2>&1 || true
+        log_info "Параметры безопасности IPv6 применены (где возможно)."
+    fi
+else
+    log_info "Отключение IPv6 пропущено пользователем."
 fi
 
-# === Шаг 8: Отключение учетной записи root ===
-log_step "Шаг 8: Отключение учетной записи root"
+# === Шаг 8: Настройка Swap ===
+log_step "Шаг 8: Настройка Swap"
+if ! swapon --show | grep -q "partition\|file"; then
+    read -p "Создать Swap файл? (y/n, default: y): " create_swap
+    create_swap=${create_swap:-y}
+    
+    if [[ "$create_swap" =~ ^[Yy]$ ]]; then
+        # Автоопределение размера (2GB или RAM, если меньше)
+        # Для простоты скрипта ставим дефолт 2GB.
+        SWAP_SIZE="2G"
+        
+
+        if run_silent "Создание файла Swap ($SWAP_SIZE)" create_swap_file "$SWAP_SIZE"; then
+            echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+            
+            # Тюнинг подкачки
+            apply_sysctl "vm.swappiness" "10"
+            apply_sysctl "vm.vfs_cache_pressure" "50"
+            
+            log_info "Swap ($SWAP_SIZE) создан и настроен."
+        else
+             log_err "Не удалось создать Swap."
+        fi
+    fi
+else
+    log_info "Swap уже активен."
+fi
+
+# === Шаг 9: Включение TCP BBR ===
+log_step "Шаг 9: Включение TCP BBR"
+read -p "Включить TCP BBR? (y/n, default: y): " enable_bbr
+enable_bbr=${enable_bbr:-y}
+
+if [[ "$enable_bbr" =~ ^[Yy]$ ]]; then
+    if ! grep -q "tcp_congestion_control = bbr" /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null; then
+        apply_sysctl "net.core.default_qdisc" "fq"
+        apply_sysctl "net.ipv4.tcp_congestion_control" "bbr"
+        sysctl --system > /dev/null 2>&1 || true
+        log_info "TCP BBR включен (где возможно)."
+    else
+        log_info "BBR уже включен."
+    fi
+fi
+
+# === Шаг 10: Полезный софт (Docker & NTP) ===
+log_step "Шаг 10: Установка дополнительного ПО"
+
+# 10.1 Docker
+read -p "Установить Docker? (y/n, default: n): " install_docker
+install_docker=${install_docker:-n}
+
+if [[ "$install_docker" =~ ^[Yy]$ ]]; then
+    log_info "Установка Docker..."
+    if command -v docker &> /dev/null; then
+        log_warn "Docker уже установлен."
+    else
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        run_silent "Установка Docker" sh get-docker.sh
+        rm get-docker.sh
+        usermod -aG docker "$new_user"
+        log_info "Пользователь $new_user добавлен в группу docker."
+    fi
+fi
+
+# 10.2 NTP (Chrony)
+read -p "Установить NTP (Chrony) для синхронизации времени? (y/n, default: y): " install_ntp
+install_ntp=${install_ntp:-y}
+
+if [[ "$install_ntp" =~ ^[Yy]$ ]]; then
+    run_silent "Установка Chrony" apt-get $APT_OPTS install -y chrony
+    systemctl enable chrony > /dev/null 2>&1
+    systemctl start chrony > /dev/null 2>&1
+    log_info "Chrony установлен и запущен."
+fi
+
+# === Шаг 11: Отключение учетной записи root ===
+log_step "Шаг 11: Отключение учетной записи root"
 if [ "$(passwd -S root | awk '{print $2}')" != "L" ]; then
     read -p "Отключить учетную запись root? (yes/no): " confirm
     if [[ "$confirm" == "yes" ]]; then
