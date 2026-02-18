@@ -10,18 +10,33 @@ NC='\033[0m'
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS="-o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
+# === Логирование в файл ===
+LOG_FILE="/var/log/setup-$(date +%F_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# === Защита от двойного запуска ===
+LOCKFILE="/var/run/setup.lock"
+exec 200>"$LOCKFILE"
+flock -n 200 || { echo -e "${RED}[ERROR]${NC} Скрипт уже запущен."; exit 1; }
+
+# === Cleanup при выходе ===
+cleanup() {
+    rm -f /tmp/setup_*.tmp 2>/dev/null || true
+}
+trap cleanup EXIT
+
 show_spinner() {
     local pid=$1
     local delay=0.1
     local spinstr='|/-\'
     while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
+        printf " [%c] " "$spinstr"
         local spinstr=$temp${spinstr%"$temp"}
         sleep $delay
-        printf "\b\b\b\b\b\b"
+        printf "\b\b\b\b\b"
     done
-    printf "    \b\b\b\b"
+    printf "     \b\b\b\b\b"
 }
 
 run_silent() {
@@ -56,7 +71,7 @@ apply_sysctl() {
     local file="${3:-/etc/sysctl.d/99-hardening.conf}"
     
     if sysctl -w "$key=$value" >/dev/null 2>&1; then
-        if ! grep -q "^$key = $value" "$file" 2>/dev/null; then
+        if ! grep -qF "$key = $value" "$file" 2>/dev/null; then
             echo "$key = $value" >> "$file"
         fi
         return 0
@@ -68,11 +83,21 @@ apply_sysctl() {
 
 create_swap_file() {
     local size="$1"
-    if ! fallocate -l $size /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    local size_num
+    size_num=$(echo "$size" | sed 's/[Gg]//')
+    local size_mb=$((size_num * 1024))
+    
+    # Очистка если файл уже существует
+    if [ -f /swapfile ]; then
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+    fi
+    
+    if ! fallocate -l "$size" /swapfile 2>/dev/null; then
+        dd if=/dev/zero of=/swapfile bs=1M count=$size_mb status=none
     fi
     chmod 600 /swapfile
-    mkswap /swapfile
+    mkswap /swapfile >/dev/null
     swapon /swapfile
 }
 
@@ -80,6 +105,13 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "\n${YELLOW}=== $1 ===${NC}"; }
+
+# Определяем имя SSH-сервиса (ssh на Ubuntu, sshd на Debian/новых Ubuntu)
+if systemctl cat sshd.service &>/dev/null; then
+    SSH_SERVICE="sshd"
+else
+    SSH_SERVICE="ssh"
+fi
 
 safe_ssh_restart() {
     if [ ! -d /run/sshd ]; then
@@ -89,12 +121,12 @@ safe_ssh_restart() {
 
     log_info "Валидация конфигурации SSH (sshd -t)..."
     if sshd -t; then
-        if systemctl is-active --quiet ssh.socket; then
+        if systemctl is-active --quiet ssh.socket 2>/dev/null; then
             systemctl daemon-reload
             systemctl restart ssh.socket
         fi
-        systemctl restart ssh
-        log_info "Служба SSH успешно перезапущена."
+        systemctl restart "$SSH_SERVICE"
+        log_info "Служба $SSH_SERVICE успешно перезапущена."
     else
         log_err "Конфигурация SSH содержит ошибки!"
         log_err "Рестарт отменен во избежание потери доступа."
@@ -110,45 +142,59 @@ backup_file() {
 }
 
 # 1) === Проверка Root прав ===
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
     log_err "Пожалуйста запустите скрипт от имени root."
     exit 1
 fi
 
-user_exists() { id "$1" &>/dev/null; }
-
-# 2) === Установка зависимостей ===
-log_step "Проверка зависимостей"
-run_silent "Обновление списка пакетов" apt-get $APT_OPTS update -qq
-
-MISSING_DEPS=""
-for cmd in lsb_release bc; do
-    if ! command -v $cmd &> /dev/null; then
-        MISSING_DEPS="$MISSING_DEPS $cmd"
-    fi
-done
-
-if [ -n "$MISSING_DEPS" ]; then
-    log_warn "Установка зависимостей: $MISSING_DEPS"
-    run_silent "Установка зависимостей" apt-get $APT_OPTS install -y $MISSING_DEPS
+# 1.1) === Проверка ОС (Ubuntu / Debian) ===
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="$ID"
+    OS_VERSION="$VERSION_ID"
+    OS_NAME="$PRETTY_NAME"
+else
+    OS_ID="unknown"
+    OS_VERSION="unknown"
+    OS_NAME="Unknown OS"
 fi
+
+if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
+    log_warn "Обнаружена ОС: $OS_NAME"
+    log_warn "Скрипт разработан для Ubuntu/Debian. Продолжение на свой страх и риск."
+    read -p "Продолжить? (y/n): " os_confirm
+    if [[ ! "$os_confirm" =~ ^[Yy]$ ]]; then
+        log_err "Установка отменена."
+        exit 1
+    fi
+else
+    log_info "Обнаружена ОС: $OS_NAME"
+fi
+
+user_exists() { id "$1" &>/dev/null; }
 
 # === Шаг 1: Система ===
 log_step "Шаг 1: Обновление системы"
+run_silent "Обновление списка пакетов" apt-get $APT_OPTS update -qq
 run_silent "Полное обновление системы" bash -c "apt-get $APT_OPTS full-upgrade -y && apt-get $APT_OPTS autoremove -y"
+
+# Проверяем, нужна ли перезагрузка после обновления ядра
+if [ -f /var/run/reboot-required ]; then
+    log_warn "Обнаружено обновление ядра. Рекомендуется reboot после завершения скрипта."
+fi
 
 # === Шаг 1.1: Автоматические обновления ===
 log_step "Шаг 1.1: Настройка автоматических обновлений"
-if ! dpkg -l | grep -q "unattended-upgrades"; then
+if ! dpkg -s unattended-upgrades &>/dev/null; then
     apt-get $APT_OPTS install -y unattended-upgrades
 fi
 
 if ! grep -q "APT::Periodic::Unattended-Upgrade" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << EOF
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-    dpkg-reconfigure -plow unattended-upgrades
+    dpkg-reconfigure -f noninteractive unattended-upgrades
     log_info "Автообновления безопасности включены."
 else
     log_info "Уже настроено."
@@ -163,7 +209,20 @@ log_step "Шаг 3: Создание пользователя"
 new_user=""
 while [[ -z "$new_user" ]]; do
     read -p "Введите имя нового пользователя: " new_user
-    if [[ -z "$new_user" ]]; then log_warn "Имя не может быть пустым."; fi
+    if [[ -z "$new_user" ]]; then
+        log_warn "Имя не может быть пустым."
+        continue
+    fi
+    if [[ ! "$new_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        log_warn "Некорректное имя (только a-z, 0-9, _, -). Первый символ — буква или _."
+        new_user=""
+        continue
+    fi
+    if [[ "$new_user" == "root" ]]; then
+        log_warn "Нельзя использовать 'root' как имя пользователя."
+        new_user=""
+        continue
+    fi
 done
 
 if ! user_exists "$new_user"; then
@@ -183,31 +242,112 @@ if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
     ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N "" -C "$new_user@$(hostname)"
-    cat "$SSH_DIR/id_ed25519.pub" > "$SSH_DIR/authorized_keys"
+    # Добавляем публичный ключ (не перезаписываем существующие)
+    if [ -f "$SSH_DIR/authorized_keys" ]; then
+        if ! grep -qF "$(cat "$SSH_DIR/id_ed25519.pub")" "$SSH_DIR/authorized_keys"; then
+            cat "$SSH_DIR/id_ed25519.pub" >> "$SSH_DIR/authorized_keys"
+        fi
+    else
+        cat "$SSH_DIR/id_ed25519.pub" > "$SSH_DIR/authorized_keys"
+    fi
     chmod 600 "$SSH_DIR/authorized_keys"
     chown -R "$new_user:$new_user" "$SSH_DIR"
     log_info "Ключи Ed25519 сгенерированы."
+
+    # === ВАЖНО: Показываем ключ ДО отключения паролей ===
+    echo ""
+    echo "========================================================"
+    log_warn "СКОПИРУЙТЕ ПРИВАТНЫЙ КЛЮЧ ПРЯМО СЕЙЧАС!"
+    echo "--------------------------------------------------------"
+    # Выводим ключ в терминал, минуя лог-файл
+    exec 3>&1
+    exec 1>/dev/tty 2>/dev/tty
+    cat "$SSH_DIR/id_ed25519"
+    exec 1>&3 3>&-
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    echo ""
+    echo "--------------------------------------------------------"
+    log_warn "Ключ будет УДАЛЁН в конце настройки."
+    log_warn "Убедитесь, что вы его скопировали!"
+    read -p "Скопировали ключ? (yes для продолжения): " key_copied
+    while [[ "$key_copied" != "yes" ]]; do
+        log_warn "Введите 'yes' для продолжения."
+        read -p "Скопировали ключ? (yes для продолжения): " key_copied
+    done
+    echo "========================================================"
 else
     log_info "Ключи уже существуют."
 fi
 
 # === Шаг 5: Смена порта SSH ===
 log_step "Шаг 5: Смена порта SSH"
-os_version=$(lsb_release -sr)
-sshport="" 
+os_version="${OS_VERSION:-0}"
+sshport=""
 
 while true; do
     read -p "Новый порт SSH (1024-65535): " sshport
-    if [[ "$sshport" =~ ^[0-9]+$ ]] && [ "$sshport" -gt 1023 ] && [ "$sshport" -lt 65536 ]; then
-        break
-    else
-        log_warn "Некорректный порт."
+    if [[ ! "$sshport" =~ ^[0-9]+$ ]] || [ "$sshport" -le 1023 ] || [ "$sshport" -ge 65536 ]; then
+        log_warn "Некорректный порт. Допустимый диапазон: 1024-65535."
+        continue
     fi
+    if ss -tlnp 2>/dev/null | grep -v "sshd" | grep -q ":$sshport "; then
+        log_warn "Порт $sshport уже занят другим сервисом!"
+        continue
+    fi
+    break
 done
 
+# === Сводка перед применением изменений ===
+echo ""
+echo "========================================================"
+log_info "ПРЕДВАРИТЕЛЬНАЯ СВОДКА"
+echo "--------------------------------------------------------"
+echo -e "ОС:            ${YELLOW}${OS_NAME}${NC}"
+echo -e "Пользователь:  ${YELLOW}${new_user}${NC}"
+echo -e "SSH порт:      ${YELLOW}${sshport}${NC}"
+echo "--------------------------------------------------------"
+echo -e "Будут выполнены:"
+echo -e "  • Настройка UFW (default deny) + rate-limit SSH"
+echo -e "  • Смена SSH порта и hardening"
+echo -e "  • Настройка Fail2Ban"
+echo -e "  • Блокировка ICMP (ping)"
+echo -e "  • Опционально: IPv6, Swap, BBR, Docker, Chrony"
+echo -e "  • Отключение root-доступа"
+echo "========================================================"
+read -p "Продолжить настройку? (y/n, default: y): " start_confirm
+start_confirm=${start_confirm:-y}
+if [[ ! "$start_confirm" =~ ^[Yy]$ ]]; then
+    log_err "Установка отменена пользователем."
+    exit 0
+fi
+
+# === Шаг 5.1: Настройка UFW (ДО смены порта SSH!) ===
+log_step "Шаг 5.1: Настройка UFW"
+
+# Устанавливаем дефолтные политики
+ufw default deny incoming >/dev/null 2>&1
+ufw default allow outgoing >/dev/null 2>&1
+log_info "UFW: default deny incoming, allow outgoing."
+
+# Разрешаем новый SSH порт с rate-limit (макс. 6 подключений за 30 сек)
+if ! ufw status 2>/dev/null | grep -q "$sshport/tcp"; then
+    ufw limit "$sshport"/tcp
+    log_info "Порт $sshport/tcp разрешен (rate-limited)."
+fi
+
+# Включаем UFW если не активен
+if [[ $(ufw status 2>/dev/null | head -n1) == "Status: inactive" ]]; then
+    echo "y" | ufw enable
+    log_info "UFW активирован."
+fi
+
+# === Шаг 5.2: Применение нового порта SSH ===
+log_step "Шаг 5.2: Применение нового порта SSH"
 backup_file "/etc/ssh/sshd_config"
 
-if [[ "$os_version" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$os_version >= 22.10" | bc -l) )); then
+# Сравниваем версию как major*100+minor (22.10 → 2210, 22.04 → 2204)
+os_version_num=$(echo "$os_version" | awk -F. '{printf "%d%02d", $1, $2}')
+if [[ "$os_version" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$os_version_num" -ge 2210 ]; then
     mkdir -p /etc/systemd/system/ssh.socket.d
     OVERRIDE_FILE="/etc/systemd/system/ssh.socket.d/override.conf"
 
@@ -223,44 +363,48 @@ else
     if ! grep -q "^Port $sshport" /etc/ssh/sshd_config; then
         sed -i "s/^#Port 22/Port $sshport/" /etc/ssh/sshd_config
         sed -i "s/^Port 22/Port $sshport/" /etc/ssh/sshd_config
+        # Если строки Port вообще не было в файле — добавляем
+        if ! grep -q "^Port " /etc/ssh/sshd_config; then
+            echo "Port $sshport" >> /etc/ssh/sshd_config
+        fi
         log_info "sshd_config обновлен (Port $sshport)."
     fi
 fi
 
 safe_ssh_restart
 
-# === Шаг 6: Настройка безопасности ===
-log_step "Шаг 6: Настройка безопасности"
+# === Шаг 6: Настройка безопасности SSH ===
+log_step "Шаг 6: Настройка безопасности SSH"
 
 # Чистка cloud-init конфигов
-[ -f "/etc/ssh/sshd_config.d/50-cloud-init.conf" ] && echo "PasswordAuthentication no" > "/etc/ssh/sshd_config.d/50-cloud-init.conf"
+if [ -f "/etc/ssh/sshd_config.d/50-cloud-init.conf" ]; then
+    echo "PasswordAuthentication no" > "/etc/ssh/sshd_config.d/50-cloud-init.conf"
+fi
 
 CONFIG_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
-cat > "$CONFIG_FILE" << EOF
+cat > "$CONFIG_FILE" <<EOF
 PermitRootLogin no
 PasswordAuthentication no
 ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 AddressFamily inet
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+AllowUsers $new_user
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LogLevel VERBOSE
+UseDNS no
+PermitEmptyPasswords no
 EOF
 
 log_info "Конфигурация безопасности применена."
 safe_ssh_restart
 
-# === Шаг 7: Настройка UFW ===
-log_step "Шаг 7: Настройка UFW"
-if ! ufw status | grep -q "$sshport/tcp"; then
-    ufw allow "$sshport"/tcp
-    log_info "Порт $sshport/tcp разрешен."
-fi
-
-if [[ $(ufw status | head -n1) == "Status: inactive" ]]; then
-    echo "y" | ufw enable
-    log_info "UFW активирован."
-fi
-
-# === Шаг 7.1: Настройка ICMP ===
-log_step "Шаг 7.1: Настройка ICMP"
+# === Шаг 7: Настройка ICMP ===
+log_step "Шаг 7: Настройка ICMP"
 UFW_RULES="/etc/ufw/before.rules"
 backup_file "$UFW_RULES"
 
@@ -274,25 +418,27 @@ else
     log_warn "Правило ICMP не найдено автоматически. Проверьте $UFW_RULES."
 fi
 
-# === Шаг 7.2: Настройка Fail2Ban ===
-log_step "Шаг 7.2: Настройка Fail2Ban"
-JAIL_LOCAL="/etc/fail2ban/jail.local"
-if ! grep -q "port = $sshport" "$JAIL_LOCAL" 2>/dev/null; then
-    cat > "$JAIL_LOCAL" << EOF
+# === Шаг 7.1: Настройка Fail2Ban ===
+log_step "Шаг 7.1: Настройка Fail2Ban"
+JAIL_FILE="/etc/fail2ban/jail.d/ssh-hardening.conf"
+if ! grep -qF "port = $sshport" "$JAIL_FILE" 2>/dev/null; then
+    mkdir -p /etc/fail2ban/jail.d
+    cat > "$JAIL_FILE" <<EOF
 [DEFAULT]
 bantime = 1h
 findtime = 10m
 maxretry = 5
+backend = systemd
 [sshd]
 enabled = true
 port = $sshport
 EOF
     systemctl restart fail2ban
-    log_info "Jail для SSH настроен."
+    log_info "Jail для SSH настроен ($JAIL_FILE)."
 fi
 
-# === Шаг 7.3: Настройка Sysctl ===
-log_step "Шаг 7.3: Настройка Sysctl"
+# === Шаг 7.2: Настройка Sysctl ===
+log_step "Шаг 7.2: Настройка Sysctl"
 read -p "Отключить IPv6? (y/n, default: y): " disable_ipv6
 disable_ipv6=${disable_ipv6:-y}
 
@@ -307,6 +453,10 @@ if [[ "$disable_ipv6" =~ ^[Yy]$ ]]; then
         apply_sysctl "net.ipv4.conf.default.rp_filter" "1"
         apply_sysctl "net.ipv4.tcp_syncookies" "1"
         apply_sysctl "net.ipv4.conf.all.accept_redirects" "0"
+        apply_sysctl "net.ipv4.conf.default.accept_redirects" "0"
+        apply_sysctl "net.ipv4.conf.all.send_redirects" "0"
+        apply_sysctl "net.ipv4.icmp_ignore_bogus_error_responses" "1"
+        apply_sysctl "net.ipv4.conf.all.log_martians" "1"
         
         # Перечитываем конфиги (игнорируем ошибки)
         sysctl --system > /dev/null 2>&1 || true
@@ -318,18 +468,21 @@ fi
 
 # === Шаг 8: Настройка Swap ===
 log_step "Шаг 8: Настройка Swap"
-if ! swapon --show | grep -q "partition\|file"; then
+if ! swapon --show 2>/dev/null | grep -q "partition\|file"; then
     read -p "Создать Swap файл? (y/n, default: y): " create_swap
     create_swap=${create_swap:-y}
     
     if [[ "$create_swap" =~ ^[Yy]$ ]]; then
-        # Автоопределение размера (2GB или RAM, если меньше)
-        # Для простоты скрипта ставим дефолт 2GB.
         SWAP_SIZE="2G"
-        
 
-        if run_silent "Создание файла Swap ($SWAP_SIZE)" create_swap_file "$SWAP_SIZE"; then
-            echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+        # Проверка свободного места (нужно минимум 2.5GB)
+        avail_mb=$(df -BM / | tail -1 | awk '{print $4}' | sed 's/M//')
+        if [ "$avail_mb" -lt 2560 ]; then
+            log_warn "Недостаточно места на диске (${avail_mb}MB свободно). Swap не создан."
+        elif run_silent "Создание файла Swap ($SWAP_SIZE)" create_swap_file "$SWAP_SIZE"; then
+            if ! grep -qF '/swapfile' /etc/fstab; then
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
             
             # Тюнинг подкачки
             apply_sysctl "vm.swappiness" "10"
@@ -337,7 +490,7 @@ if ! swapon --show | grep -q "partition\|file"; then
             
             log_info "Swap ($SWAP_SIZE) создан и настроен."
         else
-             log_err "Не удалось создать Swap."
+            log_err "Не удалось создать Swap."
         fi
     fi
 else
@@ -360,8 +513,23 @@ if [[ "$enable_bbr" =~ ^[Yy]$ ]]; then
     fi
 fi
 
-# === Шаг 10: Полезный софт (Docker & NTP) ===
+# === Шаг 10: Полезный софт (Docker, NTP, утилиты) ===
 log_step "Шаг 10: Установка дополнительного ПО"
+
+# 10.0 Базовые утилиты
+BASE_UTILS="htop iotop ncdu tmux curl wget net-tools"
+MISSING_UTILS=""
+for util in $BASE_UTILS; do
+    if ! dpkg -s "$util" &>/dev/null; then
+        MISSING_UTILS="$MISSING_UTILS $util"
+    fi
+done
+if [ -n "$MISSING_UTILS" ]; then
+    run_silent "Установка базовых утилит" apt-get $APT_OPTS install -y $MISSING_UTILS
+    log_info "Установлены утилиты:$MISSING_UTILS"
+else
+    log_info "Базовые утилиты уже установлены."
+fi
 
 # 10.1 Docker
 read -p "Установить Docker? (y/n, default: n): " install_docker
@@ -372,11 +540,14 @@ if [[ "$install_docker" =~ ^[Yy]$ ]]; then
     if command -v docker &> /dev/null; then
         log_warn "Docker уже установлен."
     else
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        run_silent "Установка Docker" sh get-docker.sh
-        rm get-docker.sh
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        run_silent "Установка Docker" sh /tmp/get-docker.sh
+        rm -f /tmp/get-docker.sh
         usermod -aG docker "$new_user"
         log_info "Пользователь $new_user добавлен в группу docker."
+        log_warn "ВНИМАНИЕ: Docker модифицирует iptables напрямую, минуя UFW."
+        log_warn "Порты контейнеров (-p) будут открыты снаружи несмотря на UFW."
+        log_warn "Для защиты используйте: 127.0.0.1:PORT:PORT вместо PORT:PORT."
     fi
 fi
 
@@ -391,9 +562,46 @@ if [[ "$install_ntp" =~ ^[Yy]$ ]]; then
     log_info "Chrony установлен и запущен."
 fi
 
+# === Шаг 10.3: Настройка hostname ===
+log_step "Шаг 10.3: Настройка hostname"
+current_hostname=$(hostname)
+log_info "Текущий hostname: $current_hostname"
+read -p "Изменить hostname? (введите новый или нажмите ENTER для пропуска): " new_hostname
+if [[ -n "$new_hostname" ]]; then
+    hostnamectl set-hostname "$new_hostname"
+    log_info "Hostname изменен на: $new_hostname"
+else
+    log_info "Hostname оставлен без изменений."
+fi
+
+# === Шаг 10.4: Настройка часового пояса ===
+log_step "Шаг 10.4: Настройка часового пояса"
+current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "неизвестно")
+log_info "Текущий часовой пояс: $current_tz"
+read -p "Изменить часовой пояс? (например, Europe/Moscow, или ENTER для пропуска): " new_tz
+if [[ -n "$new_tz" ]]; then
+    if timedatectl set-timezone "$new_tz" 2>/dev/null; then
+        log_info "Часовой пояс установлен: $new_tz"
+    else
+        log_warn "Не удалось установить часовой пояс '$new_tz'. Проверьте правильность."
+    fi
+else
+    log_info "Часовой пояс оставлен без изменений."
+fi
+
+# === Шаг 10.5: Отключение ненужных сервисов ===
+log_step "Шаг 10.5: Отключение ненужных сервисов"
+for svc in snapd cups; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl disable --now "$svc" 2>/dev/null || true
+        log_info "Сервис $svc отключен."
+    fi
+done
+
 # === Шаг 11: Отключение учетной записи root ===
 log_step "Шаг 11: Отключение учетной записи root"
-if [ "$(passwd -S root | awk '{print $2}')" != "L" ]; then
+root_status=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
+if [ "$root_status" != "L" ]; then
     read -p "Отключить учетную запись root? (yes/no): " confirm
     if [[ "$confirm" == "yes" ]]; then
         passwd -l root
@@ -403,29 +611,50 @@ else
     log_info "Учетная запись root уже отключена."
 fi
 
-# === Завершение настройки ===
+# === Шаг 12: Проверка доступа ===
 echo ""
 echo "========================================================"
-log_info "НАСТРОЙКА ЗАВЕРШЕНА."
+log_info "НАСТРОЙКА ПОЧТИ ЗАВЕРШЕНА."
 echo "--------------------------------------------------------"
 echo -e "User: ${YELLOW}$new_user${NC}"
 echo -e "Port: ${YELLOW}$sshport${NC}"
 echo "--------------------------------------------------------"
-log_warn "СКОПИРУЙТЕ ПРИВАТНЫЙ КЛЮЧ:"
-echo "--------------------------------------------------------"
-
-cat "$SSH_DIR/id_ed25519"
-
+log_warn "ПРОВЕРЬТЕ ДОСТУП ПЕРЕД УДАЛЕНИЕМ КЛЮЧА!"
 echo ""
+echo -e "Откройте ${YELLOW}ВТОРУЮ${NC} SSH-сессию и подключитесь:"
+echo -e "  ${GREEN}ssh -i <путь_к_ключу> -p $sshport $new_user@<IP>${NC}"
+echo ""
+echo -e "Убедитесь, что:"
+echo -e "  1. Подключение успешно"
+echo -e "  2. ${YELLOW}sudo whoami${NC} возвращает ${GREEN}root${NC}"
 echo "--------------------------------------------------------"
-read -p "Скопировали? Нажмите ENTER для удаления ключа с сервера..." confirm_del
+read -p "Подключение во второй сессии успешно? (yes/no): " access_ok
 
-rm -f "$SSH_DIR/id_ed25519"
+if [[ "$access_ok" != "yes" ]]; then
+    log_warn "Приватный ключ НЕ удалён. Файл: $SSH_DIR/id_ed25519"
+    log_warn "Разберитесь с доступом и удалите ключ вручную: rm $SSH_DIR/id_ed25519"
+    echo "========================================================"
+    log_info "Лог-файл сохранен: $LOG_FILE"
+    exit 0
+fi
 
-if [ ! -f "$SSH_DIR/id_ed25519" ]; then
-    log_info "Приватный ключ удален."
+# === Шаг 13: Удаление приватного ключа ===
+if [ -f "$SSH_DIR/id_ed25519" ]; then
+    rm -f "$SSH_DIR/id_ed25519"
+    if [ ! -f "$SSH_DIR/id_ed25519" ]; then
+        log_info "Приватный ключ удален."
+    else
+        log_err "Ошибка удаления. Удалите вручную: rm $SSH_DIR/id_ed25519"
+    fi
 else
-    log_err "Ошибка удаления. Удалите вручную: rm $SSH_DIR/id_ed25519"
+    log_info "Приватный ключ уже отсутствует."
 fi
 
 echo "========================================================"
+log_info "НАСТРОЙКА ПОЛНОСТЬЮ ЗАВЕРШЕНА."
+log_info "Лог-файл сохранен: $LOG_FILE"
+if [ -f /var/run/reboot-required ]; then
+    echo ""
+    log_warn "РЕКОМЕНДУЕТСЯ ПЕРЕЗАГРУЗКА: обновлено ядро."
+    log_warn "Выполните: sudo reboot"
+fi
