@@ -10,16 +10,13 @@ NC='\033[0m'
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS="-o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
-# === Логирование в файл ===
 LOG_FILE="/var/log/setup-$(date +%F_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# === Защита от двойного запуска ===
 LOCKFILE="/var/run/setup.lock"
 exec 200>"$LOCKFILE"
 flock -n 200 || { echo -e "${RED}[ERROR]${NC} Скрипт уже запущен."; exit 1; }
 
-# === Cleanup при выходе ===
 cleanup() {
     rm -f /tmp/setup_*.tmp 2>/dev/null || true
 }
@@ -43,16 +40,16 @@ run_silent() {
     local desc="$1"
     shift
     local log_file=$(mktemp)
-    
+
     echo -n -e "${GREEN}[INFO]${NC} ${desc}..."
-    
+
     "$@" > "$log_file" 2>&1 &
     local pid=$!
     show_spinner "$pid"
-    
+
     local exit_code=0
     wait $pid || exit_code=$?
-    
+
     if [ $exit_code -eq 0 ]; then
         echo -e "${GREEN}[OK]${NC}"
         rm -f "$log_file"
@@ -69,7 +66,7 @@ apply_sysctl() {
     local key="$1"
     local value="$2"
     local file="${3:-/etc/sysctl.d/99-hardening.conf}"
-    
+
     if sysctl -w "$key=$value" >/dev/null 2>&1; then
         if ! grep -qF "$key = $value" "$file" 2>/dev/null; then
             echo "$key = $value" >> "$file"
@@ -86,13 +83,12 @@ create_swap_file() {
     local size_num
     size_num=$(echo "$size" | sed 's/[Gg]//')
     local size_mb=$((size_num * 1024))
-    
-    # Очистка если файл уже существует
+
     if [ -f /swapfile ]; then
         swapoff /swapfile 2>/dev/null || true
         rm -f /swapfile
     fi
-    
+
     if ! fallocate -l "$size" /swapfile 2>/dev/null; then
         dd if=/dev/zero of=/swapfile bs=1M count=$size_mb status=none
     fi
@@ -106,7 +102,6 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "\n${YELLOW}=== $1 ===${NC}"; }
 
-# Определяем имя SSH-сервиса (ssh на Ubuntu, sshd на Debian/новых Ubuntu)
 if systemctl cat sshd.service &>/dev/null; then
     SSH_SERVICE="sshd"
 else
@@ -141,13 +136,11 @@ backup_file() {
     fi
 }
 
-# 1) === Проверка Root прав ===
 if [ "$(id -u)" -ne 0 ]; then
     log_err "Пожалуйста запустите скрипт от имени root."
     exit 1
 fi
 
-# 1.1) === Проверка ОС (Ubuntu / Debian) ===
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_ID="$ID"
@@ -173,17 +166,14 @@ fi
 
 user_exists() { id "$1" &>/dev/null; }
 
-# === Шаг 1: Система ===
 log_step "Шаг 1: Обновление системы"
 run_silent "Обновление списка пакетов" apt-get $APT_OPTS update -qq
 run_silent "Полное обновление системы" bash -c "apt-get $APT_OPTS full-upgrade -y && apt-get $APT_OPTS autoremove -y"
 
-# Проверяем, нужна ли перезагрузка после обновления ядра
 if [ -f /var/run/reboot-required ]; then
     log_warn "Обнаружено обновление ядра. Рекомендуется reboot после завершения скрипта."
 fi
 
-# === Шаг 1.1: Автоматические обновления ===
 log_step "Шаг 1.1: Настройка автоматических обновлений"
 if ! dpkg -s unattended-upgrades &>/dev/null; then
     apt-get $APT_OPTS install -y unattended-upgrades
@@ -200,11 +190,9 @@ else
     log_info "Уже настроено."
 fi
 
-# === Шаг 2: Установка UFW и Fail2Ban ===
 log_step "Шаг 2: Установка UFW и Fail2Ban"
 run_silent "Установка пакетов безопасности" apt-get $APT_OPTS install -y ufw fail2ban
 
-# === Шаг 3: Создание пользователя ===
 log_step "Шаг 3: Создание пользователя"
 new_user=""
 while [[ -z "$new_user" ]]; do
@@ -235,14 +223,13 @@ else
     log_info "Пользователь $new_user уже существует."
 fi
 
-# === Шаг 4: Генерация SSH ключей ===
 log_step "Шаг 4: Генерация SSH ключей"
 SSH_DIR="/home/$new_user/.ssh"
 if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
     ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N "" -C "$new_user@$(hostname)"
-    # Добавляем публичный ключ (не перезаписываем существующие)
+
     if [ -f "$SSH_DIR/authorized_keys" ]; then
         if ! grep -qF "$(cat "$SSH_DIR/id_ed25519.pub")" "$SSH_DIR/authorized_keys"; then
             cat "$SSH_DIR/id_ed25519.pub" >> "$SSH_DIR/authorized_keys"
@@ -254,12 +241,10 @@ if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
     chown -R "$new_user:$new_user" "$SSH_DIR"
     log_info "Ключи Ed25519 сгенерированы."
 
-    # === ВАЖНО: Показываем ключ ДО отключения паролей ===
     echo ""
     echo "========================================================"
     log_warn "СКОПИРУЙТЕ ПРИВАТНЫЙ КЛЮЧ ПРЯМО СЕЙЧАС!"
     echo "--------------------------------------------------------"
-    # Выводим ключ в терминал, минуя лог-файл
     exec 3>&1
     exec 1>/dev/tty 2>/dev/tty
     cat "$SSH_DIR/id_ed25519"
@@ -279,7 +264,6 @@ else
     log_info "Ключи уже существуют."
 fi
 
-# === Шаг 5: Смена порта SSH ===
 log_step "Шаг 5: Смена порта SSH"
 os_version="${OS_VERSION:-0}"
 sshport=""
@@ -297,7 +281,6 @@ while true; do
     break
 done
 
-# === Сводка перед применением изменений ===
 echo ""
 echo "========================================================"
 log_info "ПРЕДВАРИТЕЛЬНАЯ СВОДКА"
@@ -321,31 +304,25 @@ if [[ ! "$start_confirm" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# === Шаг 5.1: Настройка UFW (ДО смены порта SSH!) ===
 log_step "Шаг 5.1: Настройка UFW"
 
-# Устанавливаем дефолтные политики
 ufw default deny incoming >/dev/null 2>&1
 ufw default allow outgoing >/dev/null 2>&1
 log_info "UFW: default deny incoming, allow outgoing."
 
-# Разрешаем новый SSH порт с rate-limit (макс. 6 подключений за 30 сек)
 if ! ufw status 2>/dev/null | grep -q "$sshport/tcp"; then
     ufw limit "$sshport"/tcp
     log_info "Порт $sshport/tcp разрешен (rate-limited)."
 fi
 
-# Включаем UFW если не активен
 if [[ $(ufw status 2>/dev/null | head -n1) == "Status: inactive" ]]; then
     echo "y" | ufw enable
     log_info "UFW активирован."
 fi
 
-# === Шаг 5.2: Применение нового порта SSH ===
 log_step "Шаг 5.2: Применение нового порта SSH"
 backup_file "/etc/ssh/sshd_config"
 
-# Сравниваем версию как major*100+minor (22.10 → 2210, 22.04 → 2204)
 os_version_num=$(echo "$os_version" | awk -F. '{printf "%d%02d", $1, $2}')
 if [[ "$os_version" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$os_version_num" -ge 2210 ]; then
     mkdir -p /etc/systemd/system/ssh.socket.d
@@ -363,7 +340,6 @@ else
     if ! grep -q "^Port $sshport" /etc/ssh/sshd_config; then
         sed -i "s/^#Port 22/Port $sshport/" /etc/ssh/sshd_config
         sed -i "s/^Port 22/Port $sshport/" /etc/ssh/sshd_config
-        # Если строки Port вообще не было в файле — добавляем
         if ! grep -q "^Port " /etc/ssh/sshd_config; then
             echo "Port $sshport" >> /etc/ssh/sshd_config
         fi
@@ -373,10 +349,8 @@ fi
 
 safe_ssh_restart
 
-# === Шаг 6: Настройка безопасности SSH ===
 log_step "Шаг 6: Настройка безопасности SSH"
 
-# Чистка cloud-init конфигов
 if [ -f "/etc/ssh/sshd_config.d/50-cloud-init.conf" ]; then
     echo "PasswordAuthentication no" > "/etc/ssh/sshd_config.d/50-cloud-init.conf"
 fi
@@ -403,7 +377,6 @@ EOF
 log_info "Конфигурация безопасности применена."
 safe_ssh_restart
 
-# === Шаг 7: Настройка ICMP ===
 log_step "Шаг 7: Настройка ICMP"
 UFW_RULES="/etc/ufw/before.rules"
 backup_file "$UFW_RULES"
@@ -418,7 +391,6 @@ else
     log_warn "Правило ICMP не найдено автоматически. Проверьте $UFW_RULES."
 fi
 
-# === Шаг 7.1: Настройка Fail2Ban ===
 log_step "Шаг 7.1: Настройка Fail2Ban"
 JAIL_FILE="/etc/fail2ban/jail.d/ssh-hardening.conf"
 if ! grep -qF "port = $sshport" "$JAIL_FILE" 2>/dev/null; then
@@ -437,7 +409,6 @@ EOF
     log_info "Jail для SSH настроен ($JAIL_FILE)."
 fi
 
-# === Шаг 7.2: Настройка Sysctl ===
 log_step "Шаг 7.2: Настройка Sysctl"
 read -p "Отключить IPv6? (y/n, default: y): " disable_ipv6
 disable_ipv6=${disable_ipv6:-y}
@@ -457,25 +428,22 @@ if [[ "$disable_ipv6" =~ ^[Yy]$ ]]; then
         apply_sysctl "net.ipv4.conf.all.send_redirects" "0"
         apply_sysctl "net.ipv4.icmp_ignore_bogus_error_responses" "1"
         apply_sysctl "net.ipv4.conf.all.log_martians" "1"
-        
-        # Перечитываем конфиги (игнорируем ошибки)
+
         sysctl --system > /dev/null 2>&1 || true
-        log_info "Параметры безопасности IPv6 применены (где возможно)."
+        log_info "Параметры безопасности применены (где возможно)."
     fi
 else
     log_info "Отключение IPv6 пропущено пользователем."
 fi
 
-# === Шаг 8: Настройка Swap ===
 log_step "Шаг 8: Настройка Swap"
 if ! swapon --show 2>/dev/null | grep -q "partition\|file"; then
     read -p "Создать Swap файл? (y/n, default: y): " create_swap
     create_swap=${create_swap:-y}
-    
+
     if [[ "$create_swap" =~ ^[Yy]$ ]]; then
         SWAP_SIZE="2G"
 
-        # Проверка свободного места (нужно минимум 2.5GB)
         avail_mb=$(df -BM / | tail -1 | awk '{print $4}' | sed 's/M//')
         if [ "$avail_mb" -lt 2560 ]; then
             log_warn "Недостаточно места на диске (${avail_mb}MB свободно). Swap не создан."
@@ -483,11 +451,10 @@ if ! swapon --show 2>/dev/null | grep -q "partition\|file"; then
             if ! grep -qF '/swapfile' /etc/fstab; then
                 echo '/swapfile none swap sw 0 0' >> /etc/fstab
             fi
-            
-            # Тюнинг подкачки
+
             apply_sysctl "vm.swappiness" "10"
             apply_sysctl "vm.vfs_cache_pressure" "50"
-            
+
             log_info "Swap ($SWAP_SIZE) создан и настроен."
         else
             log_err "Не удалось создать Swap."
@@ -497,7 +464,6 @@ else
     log_info "Swap уже активен."
 fi
 
-# === Шаг 9: Включение TCP BBR ===
 log_step "Шаг 9: Включение TCP BBR"
 read -p "Включить TCP BBR? (y/n, default: y): " enable_bbr
 enable_bbr=${enable_bbr:-y}
@@ -513,10 +479,8 @@ if [[ "$enable_bbr" =~ ^[Yy]$ ]]; then
     fi
 fi
 
-# === Шаг 10: Полезный софт (Docker, NTP, утилиты) ===
 log_step "Шаг 10: Установка дополнительного ПО"
 
-# 10.0 Базовые утилиты
 BASE_UTILS="htop iotop ncdu tmux curl wget net-tools"
 MISSING_UTILS=""
 for util in $BASE_UTILS; do
@@ -531,7 +495,6 @@ else
     log_info "Базовые утилиты уже установлены."
 fi
 
-# 10.1 Docker
 read -p "Установить Docker? (y/n, default: n): " install_docker
 install_docker=${install_docker:-n}
 
@@ -551,7 +514,6 @@ if [[ "$install_docker" =~ ^[Yy]$ ]]; then
     fi
 fi
 
-# 10.2 NTP (Chrony)
 read -p "Установить NTP (Chrony) для синхронизации времени? (y/n, default: y): " install_ntp
 install_ntp=${install_ntp:-y}
 
@@ -562,7 +524,6 @@ if [[ "$install_ntp" =~ ^[Yy]$ ]]; then
     log_info "Chrony установлен и запущен."
 fi
 
-# === Шаг 10.3: Настройка hostname ===
 log_step "Шаг 10.3: Настройка hostname"
 current_hostname=$(hostname)
 log_info "Текущий hostname: $current_hostname"
@@ -574,7 +535,6 @@ else
     log_info "Hostname оставлен без изменений."
 fi
 
-# === Шаг 10.4: Настройка часового пояса ===
 log_step "Шаг 10.4: Настройка часового пояса"
 current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "неизвестно")
 log_info "Текущий часовой пояс: $current_tz"
@@ -589,7 +549,6 @@ else
     log_info "Часовой пояс оставлен без изменений."
 fi
 
-# === Шаг 10.5: Отключение ненужных сервисов ===
 log_step "Шаг 10.5: Отключение ненужных сервисов"
 for svc in snapd cups; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -598,7 +557,6 @@ for svc in snapd cups; do
     fi
 done
 
-# === Шаг 11: Отключение учетной записи root ===
 log_step "Шаг 11: Отключение учетной записи root"
 root_status=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
 if [ "$root_status" != "L" ]; then
@@ -611,7 +569,6 @@ else
     log_info "Учетная запись root уже отключена."
 fi
 
-# === Шаг 12: Проверка доступа ===
 echo ""
 echo "========================================================"
 log_info "НАСТРОЙКА ПОЧТИ ЗАВЕРШЕНА."
@@ -638,7 +595,6 @@ if [[ "$access_ok" != "yes" ]]; then
     exit 0
 fi
 
-# === Шаг 13: Удаление приватного ключа ===
 if [ -f "$SSH_DIR/id_ed25519" ]; then
     rm -f "$SSH_DIR/id_ed25519"
     if [ ! -f "$SSH_DIR/id_ed25519" ]; then
